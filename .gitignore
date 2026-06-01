@@ -1,0 +1,40 @@
+# Julia environment
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output and results
+outputs/
+*.png
+*.pdf
+*.csv
+*.xlsx
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Editor backups
+*~
+*.swp
+*.swo
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
