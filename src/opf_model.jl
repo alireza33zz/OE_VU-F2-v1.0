@@ -1,219 +1,20 @@
-# Lexicographic max-min optimization
-
 # ============================================================
-# 3-Phase Unbalanced AC-OPF with Dynamic PQ Operating Envelopes
-# and Voltage Unbalance Factor (VUF) Constraints
-# ============================================================
-
-using JuMP, Ipopt, DataFrames
-import MathOptInterface as MOI
-using Plots; gr()
-using Statistics: mean
-using LinearAlgebra, Printf, Colors
-using XLSX
-
-# ============================================================
-# 1. SYSTEM DATA
+# opf_model.jl — OPF model construction and solving
 # ============================================================
 
 """
-    SystemData
+    add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, ...)
 
-Immutable struct holding all network parameters.
-Power in W / var, voltages in V, impedances in Ω.
+Inline VUF constraints (no auxiliary variables):
+enforce |V₋|² ≤ ε²·|V₊|² and |V₊|² ≥ floor, per bus.
 """
-struct SystemData
-    nN::Int
-    nL::Int
-
-    P_Demand_a::Vector{Float64};  P_Demand_b::Vector{Float64};  P_Demand_c::Vector{Float64}
-    Q_Demand_a::Vector{Float64};  Q_Demand_b::Vector{Float64};  Q_Demand_c::Vector{Float64}
-
-    P_Cost_G::Vector{Float64}
-    P_Gen_lb::Vector{Float64};  P_Gen_ub::Vector{Float64}
-    Q_Gen_lb::Vector{Float64};  Q_Gen_ub::Vector{Float64}
-    Gen_Status::Vector{Int}
-
-    S_Sol_Gen_ub_a::Vector{Float64}
-    S_Sol_Gen_ub_b::Vector{Float64}
-    S_Sol_Gen_ub_c::Vector{Float64}
-
-    V_lb::Vector{Float64};  V_ub::Vector{Float64}
-
-    fbus::Vector{Int};  tbus::Vector{Int}
-    Zij::Vector{Matrix{ComplexF64}}   # ← changed from Matrix to Vector{Matrix}
-    Ysh::Matrix{ComplexF64}
-end
-
-function build_system_data()::SystemData
-    nN = 13;  nL = 12
-
-Demand_scaling = 1.0  # Kept at 1.0 — unbalance comes from phase asymmetry,
-                           # not raw magnitude. Higher scaling risks voltage violations
-                           # before VUF reaches the target range.
-
-# Heavily loading Phase A, moderating Phase B, and stripping Phase C
-    # This creates a significant neutral point shift to hit that 1-2% VUF target.
-    
-    P_Demand_a = Float64.([ 0,    0,    0,    0, 3000,    0,    0, 3000,    0,    0, 3000,    0,    0]) * Demand_scaling
-    P_Demand_b = Float64.([ 0,    0,    0,    0,    0, 2000,    0,    0, 2000,    0,    0, 2000,    0]) * Demand_scaling
-    P_Demand_c = Float64.([ 0,    0,    0,    0,    0,    0, 1000,    0,    0, 1000,    0,    0, 1000]) * Demand_scaling
-    # Maintaining Q ≈ 0.25 * P to keep power factor consistent (~0.97)
-    Q_Demand_a = P_Demand_a * 0.25
-    Q_Demand_b = P_Demand_b * 0.25
-    Q_Demand_c = P_Demand_c * 0.25
-
-    # Solar generation remains untouched as requested
-    S_Sol_Gen_ub_a = Float64.([ 0,    0,    0,    0, 2500,    0,    0, 2500,    0,    0, 2500,    0,    0]) .* 1.0
-    S_Sol_Gen_ub_b = Float64.([ 0,    0,    0,    0,    0, 2500,    0,    0, 2500,    0,    0, 2500,    0]) .* 1.0
-    S_Sol_Gen_ub_c = Float64.([ 0,    0,    0,    0,    0,    0, 2500,    0,    0, 2500,    0,    0, 2500]) .* 1.0
-
-    P_Cost_G   = [1.0; zeros(nN-1)]
-    P_Gen_lb   = [-3_000_000.0; zeros(nN-1)]
-    P_Gen_ub   = [ 3_000_000.0; zeros(nN-1)]
-    Q_Gen_lb   = [-500_000.0; zeros(nN-1)]
-    Q_Gen_ub   = [ 500_000.0; zeros(nN-1)]
-    Gen_Status = [1; zeros(Int,nN-1)]
-
-    V_base = 400.0 / sqrt(3)
-    V_lb   = fill(0.94 * V_base, nN) # 217.1 V
-    V_ub   = fill(1.10 * V_base, nN) # 254.0 V
-
-    fbus = [1, 2, 2, 2, 2, 3, 3, 3, 3, 4,  4,  4]
-    tbus = [2, 5, 6, 7, 3, 8, 9, 10, 4, 11, 12, 13]
-
-    # Length of each branch in km (one value per branch, same order as fbus/tbus)
-    lengths = [0.6, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1] .* 0.5
-
-    # Base impedance matrix per km (Ω/km)
-    Zij_per_km = ComplexF64[
-        0.799+0.075im  0.353+0.004im  0.353+0.004im;
-        0.353+0.004im  0.799+0.075im  0.353+0.004im;
-        0.353+0.004im  0.353+0.004im  0.799+0.075im]
-
-    # Per-branch impedance matrices: scale by length
-    Zij = [lengths[k] .* Zij_per_km for k in 1:length(fbus)]
-
-    Ysh = zeros(ComplexF64, 3, 3)
-
-    return SystemData(nN, nL,
-        P_Demand_a, P_Demand_b, P_Demand_c,
-        Q_Demand_a, Q_Demand_b, Q_Demand_c,
-        P_Cost_G, P_Gen_lb, P_Gen_ub, Q_Gen_lb, Q_Gen_ub, Gen_Status,
-        S_Sol_Gen_ub_a, S_Sol_Gen_ub_b, S_Sol_Gen_ub_c,
-        V_lb, V_ub, fbus, tbus, Zij, Ysh)
-end
-
-# ============================================================
-# 2. ADMITTANCE MATRIX
-# ============================================================
-
-"""
-    build_admittance_matrix(sys) -> Matrix{ComplexF64}
-
-Assemble the full (3·nN × 3·nN) nodal admittance matrix Y by looping over the line list.
-"""
-function build_admittance_matrix(sys::SystemData)::Matrix{ComplexF64}
-    n3 = 3 * sys.nN
-    Y  = zeros(ComplexF64, n3, n3)
-
-    for k in 1:sys.nL
-        Yl = inv(sys.Zij[k])          # k-th branch matrix
-        i = sys.fbus[k];  j = sys.tbus[k]
-        ri = (3i-2):(3i);  rj = (3j-2):(3j)
-        @inbounds begin
-            Y[ri, ri] .+= Yl;  Y[rj, rj] .+= Yl
-            Y[ri, rj] .-= Yl;  Y[rj, ri] .-= Yl
-        end
-    end
-
-    return Y
-end
-
-function build_impedance_matrix(
-    Y::Matrix{ComplexF64};
-    slack_node::Int = 1
-)::Matrix{ComplexF64}
-
-    n3  = size(Y, 1)
-
-    # Indices of the 3 slack bus phases to remove
-    slack_cols = [3*(slack_node-1)+1, 3*(slack_node-1)+2, 3*(slack_node-1)+3]
-    keep       = setdiff(1:n3, slack_cols)
-
-    # Reduced admittance matrix — guaranteed non-singular
-    Y_red = Y[keep, keep]
-    Z_red = inv(Y_red)
-
-    # Embed back into full matrix (slack rows/cols remain zero)
-    Z_full = zeros(ComplexF64, n3, n3)
-    Z_full[keep, keep] = Z_red
-
-    return Z_full
-end
-
-# ============================================================
-# 3. VUF CONSTRAINT CONFIGURATION
-# ============================================================
-
-"""
-    VUFConfig
-
-Specifies where and how tightly VUF is enforced.
-"""
-struct VUFConfig
-    buses::Vector{Int}
-    threshold::Float64
-    pos_seq_floor::Float64
-
-    function VUFConfig(buses::Vector{Int};
-                       threshold::Float64    = 0.02,
-                       pos_seq_floor::Float64 = (0.5 * 400.0/sqrt(3))^2)
-        @assert 0.0 < threshold < 1.0  "VUF threshold must be in (0, 1)."
-        new(buses, threshold, pos_seq_floor)
-    end
-end
-
-# Convenience constructor: no VUF enforcement
-VUFConfig() = VUFConfig(Int[]; threshold=0.02)
-
-# ============================================================
-# 4. RESULTS SNAPSHOT
-# ============================================================
-
-"""
-    OPFResult
-
-Extracted solution snapshot from one OPF solve.
-Decouples downstream analysis from the live JuMP model.
-"""
-struct OPFResult
-    status::MOI.TerminationStatusCode
-    obj::Float64
-
-    V_r_a::Vector{Float64};  V_i_a::Vector{Float64}
-    V_r_b::Vector{Float64};  V_i_b::Vector{Float64}
-    V_r_c::Vector{Float64};  V_i_c::Vector{Float64}
-
-    P_G_a::Vector{Float64};  Q_G_a::Vector{Float64}
-    P_G_b::Vector{Float64};  Q_G_b::Vector{Float64}
-    P_G_c::Vector{Float64};  Q_G_c::Vector{Float64}
-
-    P_sol_a::Vector{Float64};  Q_sol_a::Vector{Float64}
-    P_sol_b::Vector{Float64};  Q_sol_b::Vector{Float64}
-    P_sol_c::Vector{Float64};  Q_sol_c::Vector{Float64}
-end
-
-# ============================================================
-# 5. MODEL PIECES: VUF & POWER BALANCE
-# ============================================================
-
 """
     add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i)
 
 Inline VUF constraints without auxiliary variables:
   enforce |V₋|² ≤ ε²·|V₊|² and (|V₊|² ≥ floor) per bus.
 """
+
 function add_vuf_constraints!(
     model::JuMP.Model,
     vuf_cfg::VUFConfig,
@@ -242,10 +43,17 @@ end
 """
     add_power_balance_exact!(model, sys, Y, ...)
 
+Exact AC power balance: S = diag(V) · (Y · conj(V))
+in rectangular coordinates, using JuMP-safe expressions.
+"""
+"""
+    add_power_balance_exact!(model, sys, Y, ...)
+
 EXACT match to your original complex form:
     S = diag(V) * (Y * conj(V))
 with V in rectangular coordinates. Built with JuMP-safe expressions.
 """
+
 function add_power_balance_exact!(
     model::JuMP.Model,
     sys::SystemData,
@@ -1563,711 +1371,382 @@ function _fig_voltage(sys::SystemData, res::OPFResult,
         legend     = :bottomleft,
         legendfont = (7, _FG2),
         legendfontcolor = _FG2,
-        ylims      = (Vmin - 1.5, Vmax + 1.5),
-    )
-
-    # ── BOTTOM: VUF bars ──────────────────────────────────────────────────────
-    # Colour each bar: orange if VUF exceeds threshold, else muted blue-grey
-    thr_pct = vuf_threshold * 100.0
-    bar_cols = [v > thr_pct + 0.001 ? RGBA(0.98, 0.55, 0.18, 0.7) : RGBA(0.40, 0.55, 0.80, 0.70) for v in vuf]
-
-    bar!(p[2], nodes, vuf;
-         bar_width = 0.6,
-         fillcolor = bar_cols,
-         linecolor = bar_cols,
-         linewidth = 0.3,
-         fillalpha = 1.0,
-         label     = false)
-
-    # Threshold line
-    hline!(p[2], [thr_pct]; lc=_VUF_HI, lw=1.5, ls=:dash,
-           label=@sprintf("Limit %.0f%%", thr_pct))
-
-    plot!(p[2];
-        ylabel     = "VUF  [%]",
-        xlabel     = "Node",
-        xticks     = (nodes, string.(nodes)),
-        legend     = :topright,
-        legendfont = (7, _FG2),
-        legendfontcolor = _FG2,
-        ylims      = (0, max(maximum(vuf)*1.35, thr_pct*2.0)),
-    )
-
-    return p
-end
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FIGURE 4 — APPARENT POWER FLOWS IN LINES
-# ─────────────────────────────────────────────────────────────────────────────
 
 """
-    _fig_line_flows(sys, res) -> Plots.Plot
+    build_and_solve_opf(sys, Y, vuf_cfg; V_base, max_iter, tol, ...) -> JuMP.Model
 
-Two vertically stacked subplots:
+General AC-OPF builder / solver.
 
-  Top    : Apparent power |S_ij| = √(P²+Q²) per line per phase [kVA].
-           Rendered as a 3-column cluster per line (Ph-A, Ph-B, Ph-C).
-           Bars are hatched when active power direction is negative (P_ij < 0).
-
-  Bottom : Active power losses per line [W], non-negative for display:
-           Sum over phases of | |P_ij| − |P_ji| |.
-
-x-axis labels show the line as "i→j".
+# Keyword arguments
+- `V_base`   : nominal phase voltage magnitude [V] (default 400/√3 for NW1)
+- `max_iter` : Ipopt iteration limit
+- `tol`      : Ipopt convergence tolerance
 """
-function _fig_line_flows(sys::SystemData, res::OPFResult)
-    nL = sys.nL
-    Pij, Pji, Qij, Qji = compute_line_flows(sys, res)
-
-    # Apparent power at sending end  [kVA]  (nL × 3)
-    S_kva = sqrt.(Pij.^2 .+ Qij.^2) ./ 1000.0
-
-    # Losses per line — sum over phases of | |P_ij| − |P_ji| |  (always ≥ 0)
-    losses_W = [sum(abs.(abs.(Pij[k, :]) .- abs.(Pji[k, :]))) for k in 1:nL]
-
-    # x labels: "i→j"
-    xlabels = [@sprintf("%d→%d", sys.fbus[k], sys.tbus[k]) for k in 1:nL]
-    xpos    = collect(1:nL)
-
-    cols_solid = [_PA, _PB, _PC]
-    cols_pale  = [_PA2, _PB2, _PC2]
-    phase_lbls = ["Ph-A", "Ph-B", "Ph-C"]
-
-    p = plot(layout  = grid(2, 1; heights=[0.60, 0.40]),
-             ; _FIG_KW(1320, 620)...,
-             link    = :x,
-             bottom_margin = 8Plots.mm,
-             left_margin   = 6Plots.mm)
-
-    # ── TOP: |S| per phase per line — 3-column cluster per line ──────────────
-    # Cluster offsets for phases around each integer x = line index
-    δ_cluster = 0.22
-    offs_ph   = (-δ_cluster, 0.0, +δ_cluster)
-    w_bar     = 0.18
-
-    for ph in 1:3
-        # Hatch any bar where active power direction is negative (P_ij < 0)
-        hatch_vec = [Pij[k, ph] < 0 ? :x : :solid for k in 1:nL]   # per-bar
-
-        # Shifted x positions for this phase
-        x_pos = xpos .+ offs_ph[ph]
-
-        bar!(p[1], x_pos, S_kva[:, ph];
-             bar_width    = w_bar,
-             # no :dodge, we physically shift x to form three-column units
-             fillcolor    = cols_pale[ph],
-             linecolor    = cols_solid[ph],
-             linewidth    = 0.9,
-             fillalpha    = 1.0,
-             fillpattern  = hatch_vec,
-             label        = phase_lbls[ph])
-    end
-
-    # Total |S| envelope (thin line) at integer positions
-    S_tot = [sqrt(sum(Pij[k,:].^2 .+ Qij[k,:].^2)) / 1000.0 for k in 1:nL]
-    plot!(p[1], xpos, S_tot;
-          lc=RGBA(0,0,0,0.55), lw=1.2, ls=:dot,
-          marker=:diamond, ms=3, mc=RGBA(0,0,0,0.65), msc=:transparent,
-          label="|S| total")
-
-    plot!(p[1];
-        title      = "Apparent Power Flows and Active Losses per Line",
-        titlefont  = (11, _FG, :bold),
-        ylabel     = "|S_ij|  [kVA]",
-        xlabel     = "",
-        xticks     = (xpos, xlabels),
-        xrotation  = 35,
-        legend     = :topright,
-        legendfont = (8, _FG2),
-        legendfontcolor = _FG2,
-        ylims      = (0, max(maximum(S_tot) * 1.30, 0.05)),
-    )
-
-    # ── BOTTOM: active losses per line (non-negative) ─────────────────────────
-    bar!(p[2], xpos, losses_W;
-         bar_width = 0.55,
-         fillcolor = RGBA(0.98,0.55,0.18,0.85),
-         linecolor = RGBA(0.98,0.55,0.18,0.85),
-         linewidth = 0.3,
-         fillalpha = 1.0,
-         label     = false)
-
-    plot!(p[2];
-        ylabel     = "ΔP losses  [W]",
-        xlabel     = "Line  (from → to)",
-        xticks     = (xpos, xlabels),
-        xrotation  = 35,
-        legend     = false,
-        ylims      = (0, maximum(losses_W) * 1.35 + 1e-6),
-    )
-
-    return p
-end
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MASTER FUNCTION
-# ─────────────────────────────────────────────────────────────────────────────
-
 """
-    plot_dashboard(sys, res;
-                  vuf_threshold, save_dir, fmt) -> OrderedDict
+    build_and_solve_opf(sys, Y, vuf_cfg; ...) -> JuMP.Model
 
-Build and return all four baseline-OPF figures.
-
-Figures
-───────
-  :P_power   — Active power demand + PV injection per node/phase
-  :Q_power   — Reactive power demand + PV injection per node/phase
-  :voltage   — Voltage magnitudes + VUF per node
-  :lines     — Apparent power flows + losses per line
-
-Parameters
-──────────
-- vuf_threshold : fraction (e.g. 0.02 = 2 %) used to colour VUF bars
-- save_dir      : directory to write PNG files; "" = do not save
-- fmt           : file extension (default "png")
-
-Returns a Dict so callers can grab individual figures by key.
+General OPF builder / solver.
 """
-function plot_dashboard(
-        sys::SystemData,
-        res::OPFResult;
-        vuf_threshold::Float64 = 0.02,
-        save_dir::String       = "",
-        fmt::String            = "png"
-    )::Dict{Symbol, Plots.Plot}
 
-    println("  Building Fig 1/4 — Active power …")
-    f1 = _fig_active_power(sys, res)
+function build_and_solve_opf(
+    sys::SystemData,
+    Y::Matrix{ComplexF64},
+    vuf_cfg::VUFConfig            = VUFConfig();
+    fix_P_sol::Dict{Tuple{Int,Symbol},Float64} = Dict{Tuple{Int,Symbol},Float64}(),
+    fix_Q_sol::Dict{Tuple{Int,Symbol},Float64} = Dict{Tuple{Int,Symbol},Float64}(),
+    obj_r_node::Int      = 0,
+    obj_r_phase::Symbol  = :a,
+    obj_angle::Float64   = 0.0,
+    maximise::Bool       = false
+)::JuMP.Model
 
-    println("  Building Fig 2/4 — Reactive power …")
-    f2 = _fig_reactive_power(sys, res)
+    model = Model(Ipopt.Optimizer)
+    # Conservative, robust defaults
+    set_optimizer_attribute(model, "max_iter", max_iter)
+    set_optimizer_attribute(model, "tol",      tol)
+    set_optimizer_attribute(model, "print_level", 0)
+    set_optimizer_attribute(model, "linear_solver", "mumps")
+    set_optimizer_attribute(model, "warm_start_init_point", "no")
 
-    println("  Building Fig 3/4 — Voltages + VUF …")
-    f3 = _fig_voltage(sys, res, vuf_threshold)
+    nN = sys.nN
+    V0 = V_base
 
-    println("  Building Fig 4/4 — Line flows + losses …")
-    f4 = _fig_line_flows(sys, res)
+    # ----------------------------------------------------------
+    # Variables
+    # ----------------------------------------------------------
+    @variable(model, P_G_a[1:nN]);  @variable(model, Q_G_a[1:nN])
+    @variable(model, P_G_b[1:nN]);  @variable(model, Q_G_b[1:nN])
+    @variable(model, P_G_c[1:nN]);  @variable(model, Q_G_c[1:nN])
 
-    figs = Dict(:P_power => f1, :Q_power => f2, :voltage => f3, :lines => f4)
+    @variable(model, P_sol_a[1:nN]);  @variable(model, Q_sol_a[1:nN])
+    @variable(model, P_sol_b[1:nN]);  @variable(model, Q_sol_b[1:nN])
+    @variable(model, P_sol_c[1:nN]);  @variable(model, Q_sol_c[1:nN])
 
-    if !isempty(save_dir)
-        isdir(save_dir) || mkpath(save_dir)
-        for (key, fig) in figs
-            path = joinpath(save_dir, "opf_$(key).$fmt")
-            savefig(fig, path)
-            println("  Saved → $path")
-        end
-    end
+    @variable(model, V_a_r[1:nN], start = V0)
+    @variable(model, V_a_i[1:nN], start = 0.0)
+    @variable(model, V_b_r[1:nN], start = V0*cos(-2π/3))
+    @variable(model, V_b_i[1:nN], start = V0*sin(-2π/3))
+    @variable(model, V_c_r[1:nN], start = V0*cos( 2π/3))
+    @variable(model, V_c_i[1:nN], start = V0*sin( 2π/3))
 
-    return figs
-end
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HOW TO CALL
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# After solving the baseline OPF inside main():
-#
-#   println("\n[ Dashboard ]  Generating figures …")
-#   figs = plot_dashboard(sys, baseline_res;
-#                         vuf_threshold = 0.02,
-#                         save_dir      = "opf_figures")
-#
-#   display(figs[:P_power])
-#   display(figs[:Q_power])
-#   display(figs[:voltage])
-#   display(figs[:lines])
-#
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ============================================================
-# 12. MAIN ENTRY POINT
-# ============================================================
-
-"""
-    main(; vuf_buses, vuf_threshold, n_oe_angles, save_plot, plot_file)
-
-Top-level driver.
-"""
-function main1(;
-    vuf_buses::Vector{Int}  = Int[],      # empty = no VUF constraints
-    vuf_threshold::Float64  = 0.02,       # 2 % IEC limit
-    n_oe_angles::Int        = 36,
-    save_plot::Bool         = true,
-    plot_file::String       = "pq_operating_envelopes.png"
-)
-    # ---- Step 1: build network ----
-    println("[ 1/4 ]  Building system data …")
-    sys = build_system_data()
-    Y   = build_admittance_matrix(sys)
-######
-# Assuming Y is your 3N x 3N complex matrix
-filename = "system_matrix.xlsx"
-
-XLSX.openxlsx(filename, mode="w") do xf
-    sheet = xf[1] # Get the first sheet
-    XLSX.rename!(sheet, "Matrix_Y_Real")
-    
-    # Save Real Part
-    XLSX.writetable!(sheet, collect(eachcol(real.(Y))), [Symbol("Col_$i") for i in 1:size(Y,2)])
-    
-    # Add a second sheet for the Imaginary Part
-    sheet2 = XLSX.addsheet!(xf, "Matrix_Y_Imag")
-    XLSX.writetable!(sheet2, collect(eachcol(imag.(Y))), [Symbol("Col_$i") for i in 1:size(Y,2)])
-end
-#####
-    # ---- Step 2: configure VUF ----
-    vuf_cfg = VUFConfig(vuf_buses; threshold = vuf_threshold)
-    if isempty(vuf_buses)
-        println("[ 2/4 ]  No VUF constraints requested.")
+    # ----------------------------------------------------------
+    # Objective
+    # ----------------------------------------------------------
+    if obj_r_node > 0
+        P_tgt = (obj_r_phase==:a) ? P_sol_a[obj_r_node] :
+                (obj_r_phase==:b) ? P_sol_b[obj_r_node] : P_sol_c[obj_r_node]
+        Q_tgt = (obj_r_phase==:a) ? Q_sol_a[obj_r_node] :
+                (obj_r_phase==:b) ? Q_sol_b[obj_r_node] : Q_sol_c[obj_r_node]
+        sense = maximise ? -1.0 : 1.0
+        @objective(model, Min, sense*(cos(obj_angle)*P_tgt + sin(obj_angle)*Q_tgt))
     else
-        println("[ 2/4 ]  VUF ≤ $(vuf_threshold*100)% enforced at buses: $vuf_buses")
+        @objective(model, Min,
+            sum(sys.P_Cost_G[i]*(P_G_a[i]+P_G_b[i]+P_G_c[i]) for i in 1:nN))
     end
 
-    # ---- Step 3: solve baseline AC-OPF ----
-    println("[ 3/4 ]  Solving baseline AC-OPF …")
-    baseline_model = build_and_solve_opf(sys, Y, vuf_cfg)
-    baseline_res   = extract_result(baseline_model, sys.nN)
-    print_results(sys, baseline_res, vuf_buses)
+    # ----------------------------------------------------------
+    # Slack bus — fixed balanced reference at node 1
+    # ----------------------------------------------------------
+    fix(V_a_r[1], V0*cos(0);     force=true)
+    fix(V_a_i[1], V0*sin(0);     force=true)
+    fix(V_b_r[1], V0*cos(-2π/3); force=true)
+    fix(V_b_i[1], V0*sin(-2π/3); force=true)
+    fix(V_c_r[1], V0*cos( 2π/3); force=true)
+    fix(V_c_i[1], V0*sin( 2π/3); force=true)
 
-    # ---- Step 4: compute OEs (VUF constraints active in every directional solve) ----
-    println("\n[ 4/4 ]  Computing PQ Operating Envelopes with fairness …")
-    oe_list = compute_operating_envelopes(sys, Y, vuf_cfg, baseline_res;
-                                          n_angles = n_oe_angles)
-
-    # ---- Step 5: plot ----
-    println("\nPlotting …")
-    fig = plot_operating_envelopes(oe_list)
-    if save_plot
-        savefig(fig, plot_file)
-        println("  Plot saved → $plot_file")
-    end
-    display(fig)
-
-    return sys, baseline_res, oe_list, fig
-end
-
-function main2(;
-    vuf_buses::Vector{Int}  = Int[],      # empty = no VUF constraints
-    vuf_threshold::Float64  = 0.02,       # 2 % IEC limit
-    n_oe_angles::Int        = 36,
-    save_plot::Bool         = true,
-    plot_file::String       = "pq_operating_envelopes.png"
-)
-    # ---- Step 1: build network ----
-    println("[ 1/4 ]  Building system data …")
-    sys = build_system_data()
-    Y   = build_admittance_matrix(sys)
-
-    # ---- Step 2: configure VUF ----
-    vuf_cfg = VUFConfig(vuf_buses; threshold = vuf_threshold)
-    if isempty(vuf_buses)
-        println("[ 2/4 ]  No VUF constraints requested.")
-    else
-        println("[ 2/4 ]  VUF ≤ $(vuf_threshold*100)% enforced at buses: $vuf_buses")
+    # ----------------------------------------------------------
+    # Conventional generator limits
+    # ----------------------------------------------------------
+    for i in 1:nN
+        s = sys.Gen_Status[i]
+        for (PG, QG) in ((P_G_a,Q_G_a),(P_G_b,Q_G_b),(P_G_c,Q_G_c))
+            @constraint(model, sys.P_Gen_lb[i]*s <= PG[i] <= sys.P_Gen_ub[i]*s)
+            @constraint(model, sys.Q_Gen_lb[i]*s <= QG[i] <= sys.Q_Gen_ub[i]*s)
+        end
     end
 
-    # ---- Step 3: solve baseline AC-OPF ----
-    println("[ 3/4 ]  Solving baseline AC-OPF …")
-    baseline_model = build_and_solve_opf(sys, Y, vuf_cfg)
-    baseline_res   = extract_result(baseline_model, sys.nN)
-    print_results(sys, baseline_res, vuf_buses)
+    # ----------------------------------------------------------
+    # PV apparent power limits  |S_sol|² ≤ S_max²
+    # ----------------------------------------------------------
+    @constraint(model,[i in 1:nN], P_sol_a[i]^2+Q_sol_a[i]^2 <= sys.S_Sol_Gen_ub_a[i]^2)
+    @constraint(model,[i in 1:nN], P_sol_b[i]^2+Q_sol_b[i]^2 <= sys.S_Sol_Gen_ub_b[i]^2)
+    @constraint(model,[i in 1:nN], P_sol_c[i]^2+Q_sol_c[i]^2 <= sys.S_Sol_Gen_ub_c[i]^2)
 
-    # ---- Step 4: compute OEs (VUF constraints active in every directional solve) ----
-    println("\n[ 4/4 ]  Computing PQ Operating Envelopes with fairness …")
-    oe_list = compute_operating_envelopes_lexmaxmin(sys, Y, vuf_cfg, baseline_res;
-                                          n_angles = n_oe_angles)
-
-    # ---- Step 5: plot ----
-    println("\nPlotting …")
-    fig = plot_operating_envelopes(oe_list)
-    if save_plot
-        savefig(fig, plot_file)
-        println("  Plot saved → $plot_file")
+    # ----------------------------------------------------------
+    # Fixed PV setpoints (OE scans: freeze all units except target)
+    # ----------------------------------------------------------
+    for ((node, ph), val) in fix_P_sol
+        var = (ph==:a) ? P_sol_a : (ph==:b) ? P_sol_b : P_sol_c
+        fix(var[node], val; force=true)
     end
-    display(fig)
+    for ((node, ph), val) in fix_Q_sol
+        var = (ph==:a) ? Q_sol_a : (ph==:b) ? Q_sol_b : Q_sol_c
+        fix(var[node], val; force=true)
+    end
 
-    return sys, baseline_res, oe_list, fig
+    # ----------------------------------------------------------
+    # Voltage magnitude limits  Vmin² ≤ |V|² ≤ Vmax²
+    # ----------------------------------------------------------
+    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_a_r[i]^2+V_a_i[i]^2 <= sys.V_ub[i]^2)
+    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_b_r[i]^2+V_b_i[i]^2 <= sys.V_ub[i]^2)
+    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_c_r[i]^2+V_c_i[i]^2 <= sys.V_ub[i]^2)
+
+    # ----------------------------------------------------------
+    # VUF constraints (optional, per-bus)
+    # ----------------------------------------------------------
+    add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i)
+
+    # ----------------------------------------------------------
+    # Nodal power balance (EXACT)
+    # ----------------------------------------------------------
+    add_power_balance_exact!(model, sys, Y,
+        V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i,
+        P_G_a, P_G_b, P_G_c, Q_G_a, Q_G_b, Q_G_c,
+        P_sol_a, P_sol_b, P_sol_c, Q_sol_a, Q_sol_b, Q_sol_c)
+
+    optimize!(model)
+    return model
 end
-
-
-# ============================================================
-# RUN
-# ============================================================
-#
-# Uncomment ONE of the calls below:
-TEST_NUM = 7
-
-vuf_threshold = 0.010   # 1.5 % VUF limit (stricter than 2 % IEC limit)
-
-Angle_step = 5          # 180 angles → 2° step; 36 angles → 10° step
-number_steps = Int(360 / Angle_step)
-
-# ── Warm-up calls (cheap, triggers JIT compilation) ──────────────────────────
-main1(n_oe_angles = 1);
-main2(n_oe_angles = 1);
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# NW1-M1 — Without VUF constraints (original behaviour)
-# ════════════════════════════════════════════════════════════════════════════
-t11 = @elapsed begin
-    baseline_sys, baseline_res, oe_list11, fig11 = main1(n_oe_angles = number_steps)
-end
-t11 = round(t11; digits = 2)
-println("► M1 | No VUF  : $(t11) s")
-
-println("\n[ Dashboard ]")
-figs = plot_dashboard(baseline_sys, baseline_res;
-                      vuf_threshold = vuf_threshold,
-                      save_dir      = "opf_fairness_figures/baseline_TEST$(TEST_NUM)",
-                      fmt           = "pdf")
-display(figs[:P_power])
-display(figs[:Q_power])
-display(figs[:voltage])
-display(figs[:lines])
-
-savefig(fig11, "opf_fairness_figures/baseline_TEST$(TEST_NUM)/pq_OE.pdf")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# NW1-M1 — With VUF constraints (critical buses: 11, 12, 13)
-# ════════════════════════════════════════════════════════════════════════════
-t12 = @elapsed begin
-    sys, res, oe_list12, fig12 = main1(
-        vuf_buses     = [11, 12, 13],
-        vuf_threshold = vuf_threshold,
-        n_oe_angles   = number_steps
-    )
-end
-t12 = round(t12; digits = 2)
-println("► M1 | VUF $(vuf_threshold*100)%: $(t12) s")
-
-println("\n[ Dashboard ]")
-figs = plot_dashboard(sys, res;
-                      vuf_threshold = vuf_threshold,
-                      save_dir      = "opf_fairness_figures/vuf_$(vuf_threshold*100)pct_TEST$(TEST_NUM)",
-                      fmt           = "pdf")
-display(figs[:P_power])
-display(figs[:Q_power])
-display(figs[:voltage])
-display(figs[:lines])
-
-savefig(fig12, "opf_fairness_figures/vuf_$(vuf_threshold*100)pct_TEST$(TEST_NUM)/pq_OE.pdf")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# NW1-M2 (LexMaxMin) — Without VUF constraints
-# ════════════════════════════════════════════════════════════════════════════
-t21 = @elapsed begin
-    baseline_sys, baseline_res, oe_list21, fig21 = main2(n_oe_angles = number_steps)
-end
-t21 = round(t21; digits = 2)
-println("► M2 | No VUF  : $(t21) s")
-
-println("\n[ Dashboard ]")
-figs = plot_dashboard(baseline_sys, baseline_res;
-                      vuf_threshold = vuf_threshold,
-                      save_dir      = "opf_fairness_LEX_figures/baseline_TEST$(TEST_NUM)",
-                      fmt           = "pdf")
-display(figs[:P_power])
-display(figs[:Q_power])
-display(figs[:voltage])
-display(figs[:lines])
-
-savefig(fig21, "opf_fairness_LEX_figures/baseline_TEST$(TEST_NUM)/pq_OE.pdf")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# NW1-M2 (LexMaxMin) — With VUF constraints (critical buses: 11, 12, 13)
-# ════════════════════════════════════════════════════════════════════════════
-t22 = @elapsed begin
-    sys, res, oe_list22, fig22 = main2(
-        vuf_buses     = [11, 12, 13],
-        vuf_threshold = vuf_threshold,
-        n_oe_angles   = number_steps
-    )
-end
-t22 = round(t22; digits = 2)
-println("► M2 | VUF $(vuf_threshold*100)%: $(t22) s")
-
-println("\n[ Dashboard ]")
-figs = plot_dashboard(sys, res;
-                      vuf_threshold = vuf_threshold,
-                      save_dir      = "opf_fairness_LEX_figures/vuf_$(vuf_threshold*100)pct_TEST$(TEST_NUM)",
-                      fmt           = "pdf")
-display(figs[:P_power])
-display(figs[:Q_power])
-display(figs[:voltage])
-display(figs[:lines])
-
-savefig(fig22, "opf_fairness_LEX_figures/vuf_$(vuf_threshold*100)pct_TEST$(TEST_NUM)/pq_OE.pdf")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Runtime summary
-# ════════════════════════════════════════════════════════════════════════════
-println("\n┌─────────────────────────────────────────┐")
-println("│            Runtime Summary (NW1)        │")
-println("├───────────────────────┬─────────────────┤")
-println("│ M1  │ No VUF          │  $(lpad(t11, 8)) s  │")
-println("│ M1  │ VUF $(vuf_threshold*100)%        │  $(lpad(t12, 8)) s  │")
-println("│ M2  │ No VUF          │  $(lpad(t21, 8)) s  │")
-println("│ M2  │ VUF $(vuf_threshold*100)%        │  $(lpad(t22, 8)) s  │")
-println("└───────────────────────┴─────────────────┘")
-#
-
 
 """
-    plot_operating_envelopes_overlay(oe_lists; names, colors, fillalphas, linestyles) -> Plot
-
-Overlays multiple OE scenarios (each is Vector{OEBoundary}) on the same grid layout.
-Alignment is done by (node, phase) using oe.unit.node and oe.unit.phase.
+    extract_result(model, nN) -> OPFResult
 """
-function plot_operating_envelopes_overlay(
-    oe_lists::Vector{Vector{OEBoundary}};
-    names      = ["Scen1","Scen2","Scen3","Scen4"],
-    colors     = [:dodgerblue, :dodgerblue, :darkorange, :darkorange],
-    fillalphas = [0.10, 0.18, 0.10, 0.18],
-    linestyles = [:solid, :dash, :solid, :dash],
-    scale      = 1e-3,
-    dpi        = 900
-)
-
-    @assert length(oe_lists) == length(names) == length(colors) ==
-            length(fillalphas) == length(linestyles)
-
-    key_of(oe) = (oe.unit.node, oe.unit.phase)
-
-    #  rename from "keys" to "ref_keys"
-    ref_keys = [key_of(oe) for oe in oe_lists[1]]
-    n = length(ref_keys)
-
-    # Lookup map for each scenario
-    maps = [Dict(key_of(oe) => oe for oe in oelist) for oelist in oe_lists]
-
-    # sanity check (now uses Base.keys)
-    for (i, mp) in enumerate(maps)
-        missing = setdiff(ref_keys, collect(Base.keys(mp)))
-        if !isempty(missing)
-            error("Scenario $(i) is missing node/phase keys: $(missing)")
-        end
-    end
-
-    # Layout
-    nrows = 3
-    ncols = ceil(Int, n / nrows)
-
-    p = plot(layout=(nrows,ncols), size=(ncols*320, nrows*320),
-             margin=5Plots.mm, background_color=:white, dpi=dpi)
-
-    θ_circ = range(0, 2π, length=200)
-
-    for (k, key) in enumerate(ref_keys)
-        ax = p[k]
-
-        oe_ref = maps[1][key]
-        S_max  = oe_ref.unit.S_max * scale
-
-        # Smax circle
-        plot!(ax, S_max .* cos.(θ_circ), S_max .* sin.(θ_circ);
-              lc=:grey60, ls=:dash, lw=1.2, label=false)
-
-        # Overlay scenarios
-        for s in eachindex(oe_lists)
-            oe = maps[s][key]
-
-            if length(oe.P_boundary) >= 3
-                cx = mean(oe.P_boundary);  cy = mean(oe.Q_boundary)
-                idx = sortperm(atan.(oe.Q_boundary .- cy, oe.P_boundary .- cx))
-                Ps  = [oe.P_boundary[idx]; oe.P_boundary[idx[1]]] .* scale
-                Qs  = [oe.Q_boundary[idx]; oe.Q_boundary[idx[1]]] .* scale
-
-                plot!(ax, Ps, Qs;
-                      seriestype=:shape,
-                      fillcolor=colors[s], fillalpha=fillalphas[s],
-                      lc=colors[s], lw=1.8, ls=linestyles[s],
-                      label = (k==1 ? names[s] : false))
-            end
-        end
-
-        # Baseline star (reference scenario)
-        scatter!(ax, [oe_ref.P_baseline*scale], [oe_ref.Q_baseline*scale];
-                 marker=:star5, ms=8, mc=:crimson, msc=:crimson, label=false)
-
-        hline!(ax, [0.0]; lc=:black, lw=0.6, ls=:dot, label=false)
-        vline!(ax, [0.0]; lc=:black, lw=0.6, ls=:dot, label=false)
-
-        title!(ax, "Node $(oe_ref.unit.node) · Ph $(uppercase(string(oe_ref.unit.phase)))")
-        xlabel!(ax, "P (kW)"); ylabel!(ax, "Q (kvar)")
-
-        plot!(ax, legend=(k==1), legendfont=font(7), titlefont=font(9,:bold),
-              tickfont=font(7), guidefont=font(8),
-              aspect_ratio=:equal, framestyle=:box, grid=true, gridalpha=0.25)
-    end
-
-    for k in n+1:nrows*ncols
-        plot!(p[k], axis=false, ticks=false, grid=false, label=false)
-    end
-
-    return p
+function extract_result(model::JuMP.Model, nN::Int)::OPFResult
+    ts = termination_status(model)
+    obj = (ts == MOI.LOCALLY_SOLVED || ts == MOI.OPTIMAL) ? objective_value(model) : NaN
+    return OPFResult(ts, obj,
+        value.(model[:V_a_r]), value.(model[:V_a_i]),
+        value.(model[:V_b_r]), value.(model[:V_b_i]),
+        value.(model[:V_c_r]), value.(model[:V_c_i]),
+        value.(model[:P_G_a]), value.(model[:Q_G_a]),
+        value.(model[:P_G_b]), value.(model[:Q_G_b]),
+        value.(model[:P_G_c]), value.(model[:Q_G_c]),
+        value.(model[:P_sol_a]), value.(model[:Q_sol_a]),
+        value.(model[:P_sol_b]), value.(model[:Q_sol_b]),
+        value.(model[:P_sol_c]), value.(model[:Q_sol_c]))
 end
 
-p = plot_operating_envelopes_overlay(
-    [oe_list11, oe_list12, oe_list21, oe_list22];
-    names      = ["M1 baseline", "M1 +VUF", "M2 baseline", "M2 +VUF"],
-    colors     = [colorant"#56B4E9", colorant"#0072B2",
-                  colorant"#E69F00", colorant"#D55E00"],
-    linestyles = [:solid, :dash, :solid, :dash],
-    fillalphas = [0.2, 0.05, 0.2, 0.05]
-)
+# ============================================================
+# 7. VUF POST-PROCESSING (analytical, from OPFResult)
+# ============================================================
 
-display(p)
+"""
+    compute_vuf(res, nN) -> Vector{Float64}
 
-savefig(p, "Graphics/overlay_M1_M2_states_TEST$(TEST_NUM).pdf")
+Compute the Voltage Unbalance Factor (%) at every bus from a solved OPFResult.
 
-using FileIO, ImageIO, ImageCore
+VUF(%) = 100 · |V₋| / |V₊|
+"""
+function compute_vuf(res::OPFResult, nN::Int)::Vector{Float64}
+    ar, ai   = -0.5,  sqrt(3)/2
+    a2r, a2i = -0.5, -sqrt(3)/2
 
-font_name = "Courier"
+    vuf = zeros(nN)
+    for i in 1:nN
+        Va_r = res.V_r_a[i];  Va_i = res.V_i_a[i]
+        Vb_r = res.V_r_b[i];  Vb_i = res.V_i_b[i]
+        Vc_r = res.V_r_c[i];  Vc_i = res.V_i_c[i]
 
-function plot_operating_envelopes_overlay_legend(
-    oe_lists::Vector{Vector{OEBoundary}};
-    names      = ["Scen1","Scen2","Scen3","Scen4"],
-    colors     = [:dodgerblue, :dodgerblue, :darkorange, :darkorange],
-    fillalphas = [0.10, 0.18, 0.10, 0.18],
-    linestyles = [:solid, :dash, :solid, :dash],
-    scale      = 1e-3,
-    dpi        = 900
-)
-    @assert length(oe_lists) == length(names) == length(colors) ==
-            length(fillalphas) == length(linestyles)
+        # Positive sequence
+        Vp_r = (1/3)*(Va_r + ar*Vb_r - ai*Vb_i + a2r*Vc_r - a2i*Vc_i)
+        Vp_i = (1/3)*(Va_i + ar*Vb_i + ai*Vb_r + a2r*Vc_i + a2i*Vc_r)
 
-    key_of(oe) = (oe.unit.node, oe.unit.phase)
-    ref_keys   = [key_of(oe) for oe in oe_lists[1]]
-    n          = length(ref_keys)
-    maps       = [Dict(key_of(oe) => oe for oe in oelist) for oelist in oe_lists]
+        # Negative sequence
+        Vn_r = (1/3)*(Va_r + a2r*Vb_r - a2i*Vb_i + ar*Vc_r - ai*Vc_i)
+        Vn_i = (1/3)*(Va_i + a2r*Vb_i + a2i*Vb_r + ar*Vc_i + ai*Vc_r)
 
-    for (i, mp) in enumerate(maps)
-        missing_keys = setdiff(ref_keys, collect(Base.keys(mp)))
-        isempty(missing_keys) || error("Scenario $i missing keys: $missing_keys")
+        Vp_mag = sqrt(Vp_r^2 + Vp_i^2)
+        Vn_mag = sqrt(Vn_r^2 + Vn_i^2)
+
+        vuf[i] = Vp_mag > 1e-9 ? 100.0 * Vn_mag / Vp_mag : 0.0
     end
-
-    nrows = 3
-    ncols = ceil(Int, n / nrows)
-    W     = ncols * 320
-    H     = nrows * 320
-
-    # ── main grid (no legend) ────────────────────────────────────────────────
-    p_grid = plot(layout = (nrows, ncols),
-                  size   = (W, H),
-                  margin = 5Plots.mm,
-                  background_color = :white,
-                  dpi = dpi,
-                  fontfamily = font_name)
-
-    θ_circ = range(0, 2π, length=200)
-
-    for (k, key) in enumerate(ref_keys)
-        ax     = p_grid[k]
-        oe_ref = maps[1][key]
-        S_max  = oe_ref.unit.S_max * scale
-
-        plot!(ax, S_max .* cos.(θ_circ), S_max .* sin.(θ_circ);
-              lc=:grey60, ls=:dash, lw=1.2, label=false)
-
-        for s in eachindex(oe_lists)
-            oe = maps[s][key]
-            if length(oe.P_boundary) >= 3
-                cx  = mean(oe.P_boundary);  cy = mean(oe.Q_boundary)
-                idx = sortperm(atan.(oe.Q_boundary .- cy, oe.P_boundary .- cx))
-                Ps  = [oe.P_boundary[idx]; oe.P_boundary[idx[1]]] .* scale
-                Qs  = [oe.Q_boundary[idx]; oe.Q_boundary[idx[1]]] .* scale
-
-                plot!(ax, Ps, Qs;
-                      seriestype = :shape,
-                      fillcolor  = colors[s], fillalpha = fillalphas[s],
-                      lc = colors[s], lw = 1.8, ls = linestyles[s],
-                      label = false)
-            end
-        end
-
-        # scatter!(ax, [oe_ref.P_baseline*scale], [oe_ref.Q_baseline*scale];
-        #         marker=:star5, ms=8, mc=:crimson, msc=:crimson, label=false)
-
-        hline!(ax, [0.0]; lc=:black, lw=0.6, ls=:dot, label=false)
-        vline!(ax, [0.0]; lc=:black, lw=0.6, ls=:dot, label=false)
-
-        title!(ax, "Node $(oe_ref.unit.node) · Ph $(uppercase(string(oe_ref.unit.phase)))")
-        xlabel!(ax, "P (kW)"); ylabel!(ax, "Q (kvar)")
-
-        plot!(ax,
-              legend       = false,
-              titlefont    = font(15, fontfamily = font_name, :bold),
-              tickfont     = font(8, font_name),
-              guidefont    = font(12, font_name),
-              aspect_ratio = :equal,
-              framestyle   = :box,
-              grid         = true,
-              gridalpha    = 0.25)
-    end
-
-    for k in n+1 : nrows*ncols
-        plot!(p_grid[k], axis=false, ticks=false, grid=false, label=false)
-    end
-
-    # ── legend-only plot (full width, generous height for PDF) ───────────────
-    p_leg = plot(size             = (W, 60),
-                 margin           = 0Plots.mm,
-                 background_color = :white,
-                 dpi              = dpi,
-                 fontfamily      = font_name)
-
-    for s in eachindex(oe_lists)
-        plot!(p_leg, Float64[], Float64[];
-              seriestype = :shape,
-              fillcolor  = colors[s], fillalpha = fillalphas[s],
-              lc = colors[s], lw = 1.8, ls = linestyles[s],
-              label = names[s])
-    end
-
-    plot!(p_leg,
-          axis                    = false,
-          ticks                   = false,
-          grid                    = false,
-          legend                  = :inside,
-          legendfont              = font(12, font_name),
-          legend_columns          = length(oe_lists),
-          background_color_inside = :white,
-          foreground_color_legend = :black)
-
-    return p_grid, p_leg
+    return vuf
 end
 
-# helper
-fill_img(c, h, w) = fill(c, h, w)
+# ============================================================
+# 8. LINE FLOW CALCULATION
+# ============================================================
 
+function compute_line_flows(sys::SystemData, res::OPFResult)
+    nL  = sys.nL
+    
+    # Pre-allocate result matrices
+    Pij = zeros(nL, 3);  Pji = zeros(nL, 3)
+    Qij = zeros(nL, 3);  Qji = zeros(nL, 3)
 
-p_grid, p_leg = plot_operating_envelopes_overlay_legend(
-                [oe_list11, oe_list12, oe_list21, oe_list22];
-                names      = ["M1 baseline", "M1 +VUF", "M2 baseline", "M2 +VUF"],
-                colors     = [colorant"#56B4E9", colorant"#0072B2",
-                colorant"#E69F00", colorant"#D55E00"],
-                linestyles = [:solid, :dash, :solid, :dash],
-                fillalphas = [0.2, 0.05, 0.2, 0.05]
-)
+    for k in 1:nL
+        # --- 1. Line-specific Admittance Calculation ---
+        # Since Zij is now a Vector, we index it by k before inverting
+        Yl = inv(sys.Zij[k])
+        
+        # Build the 6x6 branch admittance matrix for THIS specific line
+        # This handles the pi-model (series admittance + shunt capacitance)
+        Yl6 = [(Yl + 0.5 .* sys.Ysh) (-Yl); 
+               (-Yl)                (Yl + 0.5 .* sys.Ysh)]
 
-# display in REPL / VSCode
-display(p_grid)
-display(p_leg)
+        # --- 2. Voltage Vector Extraction ---
+        i = sys.fbus[k]
+        j = sys.tbus[k]
+        
+        # Construct the 6-element complex voltage vector [Vi_abc; Vj_abc]
+        v = [res.V_r_a[i] + im*res.V_i_a[i]; 
+             res.V_r_b[i] + im*res.V_i_b[i];
+             res.V_r_c[i] + im*res.V_i_c[i]; 
+             res.V_r_a[j] + im*res.V_i_a[j];
+             res.V_r_b[j] + im*res.V_i_b[j]; 
+             res.V_r_c[j] + im*res.V_i_c[j]]
 
-# save — two options:
+        # --- 3. Power Flow Calculation ---
+        # S = V * conj(I), where I = Y * V
+        Sij = v[1:3] .* conj.(Yl6[1:3, :] * v)
+        Sji = v[4:6] .* conj.(Yl6[4:6, :] * v)
 
-# Option A: save as PNG (raster, fine for submission if dpi=900)
-savefig(p_grid, "Graphics/overlay_M1_M2_states_TEST$(TEST_NUM)_grid.svg")
-savefig(p_leg,  "Graphics/overlay_M1_M2_states_TEST$(TEST_NUM)_legend.svg")
+        # --- 4. Store Results ---
+        Pij[k, :] = real.(Sij)
+        Qij[k, :] = imag.(Sij)
+        Pji[k, :] = real.(Sji)
+        Qji[k, :] = imag.(Sji)
+    end
 
-# Option B: true single stacked PDF via pdfunite (if you have poppler installed)
-# run(`pdfunite Graphics/overlay_M1_M2_states_grid.pdf Graphics/overlay_M1_M2_states_legend.pdf Graphics/overlay_M1_M2_states.pdf`)
+    return Pij, Pji, Qij, Qji
+end
+
+# ============================================================
+# 9. OPERATING ENVELOPE (model reuse; no unsafe warm starts)
+# ============================================================
+
+struct PVUnit
+    node::Int
+    phase::Symbol
+    S_max::Float64
+end
+
+struct OEBoundary
+    unit::PVUnit
+    P_boundary::Vector{Float64}
+    Q_boundary::Vector{Float64}
+    P_baseline::Float64
+    Q_baseline::Float64
+end
+
+"""
+    build_oe_model(sys, Y, vuf_cfg; V_base, max_iter, tol, fix_P, fix_Q, unit) -> JuMP.Model
+
+Build one reusable OE model for a given PV unit, with all other units fixed.
+"""
+function build_oe_model(
+    sys::SystemData, Y::Matrix{ComplexF64}, vuf_cfg::VUFConfig;
+    V_base::Float64  = 400.0 / sqrt(3),
+    max_iter::Int    = 200_000,
+    tol::Float64     = 1e-6,
+    fix_P::Dict{Tuple{Int,Symbol},Float64},
+    fix_Q::Dict{Tuple{Int,Symbol},Float64},
+    unit::PVUnit
+)::JuMP.Model
+
+    model = Model(Ipopt.Optimizer)
+    set_optimizer_attribute(model, "max_iter", max_iter)
+    set_optimizer_attribute(model, "tol",      tol)
+    set_optimizer_attribute(model, "print_level", 0)
+    set_optimizer_attribute(model, "linear_solver", "mumps")
+    set_optimizer_attribute(model, "warm_start_init_point", "no")
+
+    nN = sys.nN
+    V0 = V_base
+
+    # Variables
+    @variable(model, P_G_a[1:nN]);  @variable(model, Q_G_a[1:nN])
+    @variable(model, P_G_b[1:nN]);  @variable(model, Q_G_b[1:nN])
+    @variable(model, P_G_c[1:nN]);  @variable(model, Q_G_c[1:nN])
+
+    @variable(model, P_sol_a[1:nN]);  @variable(model, Q_sol_a[1:nN])
+    @variable(model, P_sol_b[1:nN]);  @variable(model, Q_sol_b[1:nN])
+    @variable(model, P_sol_c[1:nN]);  @variable(model, Q_sol_c[1:nN])
+
+    @variable(model, V_a_r[1:nN], start = V0)
+    @variable(model, V_a_i[1:nN], start = 0.0)
+    @variable(model, V_b_r[1:nN], start = V0*cos(-2π/3))
+    @variable(model, V_b_i[1:nN], start = V0*sin(-2π/3))
+    @variable(model, V_c_r[1:nN], start = V0*cos( 2π/3))
+    @variable(model, V_c_i[1:nN], start = V0*sin( 2π/3))
+
+    # Slack
+    fix(V_a_r[1], V0*cos(0);     force=true)
+    fix(V_a_i[1], V0*sin(0);     force=true)
+    fix(V_b_r[1], V0*cos(-2π/3); force=true)
+    fix(V_b_i[1], V0*sin(-2π/3); force=true)
+    fix(V_c_r[1], V0*cos( 2π/3); force=true)
+    fix(V_c_i[1], V0*sin( 2π/3); force=true)
+
+    # Limits
+    for i in 1:nN
+        s = sys.Gen_Status[i]
+        for (PG, QG) in ((P_G_a,Q_G_a),(P_G_b,Q_G_b),(P_G_c,Q_G_c))
+            @constraint(model, sys.P_Gen_lb[i]*s <= PG[i] <= sys.P_Gen_ub[i]*s)
+            @constraint(model, sys.Q_Gen_lb[i]*s <= QG[i] <= sys.Q_Gen_ub[i]*s)
+        end
+    end
+    @constraint(model,[i in 1:nN], P_sol_a[i]^2+Q_sol_a[i]^2 <= sys.S_Sol_Gen_ub_a[i]^2)
+    @constraint(model,[i in 1:nN], P_sol_b[i]^2+Q_sol_b[i]^2 <= sys.S_Sol_Gen_ub_b[i]^2)
+    @constraint(model,[i in 1:nN], P_sol_c[i]^2+Q_sol_c[i]^2 <= sys.S_Sol_Gen_ub_c[i]^2)
+
+    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_a_r[i]^2+V_a_i[i]^2 <= sys.V_ub[i]^2)
+    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_b_r[i]^2+V_b_i[i]^2 <= sys.V_ub[i]^2)
+    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_c_r[i]^2+V_c_i[i]^2 <= sys.V_ub[i]^2)
+
+    # Fix all other PVs at baseline values (passed in fix_P, fix_Q)
+    for ((node, ph), val) in fix_P
+        var = (ph==:a) ? P_sol_a : (ph==:b) ? P_sol_b : P_sol_c
+        fix(var[node], val; force=true)
+    end
+    for ((node, ph), val) in fix_Q
+        var = (ph==:a) ? Q_sol_a : (ph==:b) ? Q_sol_b : Q_sol_c
+        fix(var[node], val; force=true)
+    end
+
+    # VUF & power balance
+    add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i)
+    add_power_balance_exact!(model, sys, Y,
+        V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i,
+        P_G_a, P_G_b, P_G_c, Q_G_a, Q_G_b, Q_G_c,
+        P_sol_a, P_sol_b, P_sol_c, Q_sol_a, Q_sol_b, Q_sol_c)
+
+    return model
+end
+
+"""
+    set_directional_objective!(model, unit, θ)
+
+Set (or update) the directional maximisation objective for `unit` at angle θ.
+"""
+function set_directional_objective!(model::JuMP.Model, unit::PVUnit, θ::Float64)
+    P = unit.phase==:a ? model[:P_sol_a][unit.node] :
+        unit.phase==:b ? model[:P_sol_b][unit.node] : model[:P_sol_c][unit.node]
+    Q = unit.phase==:a ? model[:Q_sol_a][unit.node] :
+        unit.phase==:b ? model[:Q_sol_b][unit.node] : model[:Q_sol_c][unit.node]
+    @objective(model, Max, cos(θ)*P + sin(θ)*Q)
+end
+
+"""
+    extract_result(model, nN) -> OPFResult
+
+Pull decision-variable values from a solved JuMP model into an OPFResult.
+"""
+"""
+    extract_result(model, nN) -> OPFResult
+"""
+
+function extract_result(model::JuMP.Model, nN::Int)::OPFResult
+    ts = termination_status(model)
+    obj = (ts == MOI.LOCALLY_SOLVED || ts == MOI.OPTIMAL) ? objective_value(model) : NaN
+    return OPFResult(ts, obj,
+        value.(model[:V_a_r]), value.(model[:V_a_i]),
+        value.(model[:V_b_r]), value.(model[:V_b_i]),
+        value.(model[:V_c_r]), value.(model[:V_c_i]),
+        value.(model[:P_G_a]), value.(model[:Q_G_a]),
+        value.(model[:P_G_b]), value.(model[:Q_G_b]),
+        value.(model[:P_G_c]), value.(model[:Q_G_c]),
+        value.(model[:P_sol_a]), value.(model[:Q_sol_a]),
+        value.(model[:P_sol_b]), value.(model[:Q_sol_b]),
+        value.(model[:P_sol_c]), value.(model[:Q_sol_c]))
+end
