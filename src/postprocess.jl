@@ -9,6 +9,7 @@ Compute the Voltage Unbalance Factor (%) at every bus from a solved OPFResult.
 
 VUF(%) = 100 · |V₋| / |V₊|
 """
+
 function compute_vuf(res::OPFResult, nN::Int)::Vector{Float64}
     ar, ai   = -0.5,  sqrt(3)/2
     a2r, a2i = -0.5, -sqrt(3)/2

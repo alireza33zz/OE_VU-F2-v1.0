@@ -7,6 +7,7 @@
 
 Print all result tables to stdout.
 """
+
 function print_results(sys::SystemData, res::OPFResult, vuf_buses::Vector{Int}=Int[])
     println("\n", "="^72)
     println("  3-PHASE AC-OPF RESULTS")
@@ -65,6 +66,7 @@ function print_results(sys::SystemData, res::OPFResult, vuf_buses::Vector{Int}=I
 """
     plot_operating_envelopes(oe_list) -> Plots.Plot
 """
+
 function plot_operating_envelopes(oe_list::Vector{OEBoundary})
     n     = length(oe_list)
     nrows = floor(Int, sqrt(n * 1.0))
@@ -119,6 +121,7 @@ x-axis: node index.  y-axis: kW.
 Legend is arranged as 3 columns × 2 rows and placed outside (top center).
 Solar injection uses a distinct hatch fill.
 """
+
 function _fig_active_power(sys::SystemData, res::OPFResult)
     nodes = collect(_NODES)
     scale = 1e-3   # W → kW
@@ -161,6 +164,7 @@ Same layout as Fig 1, but for reactive power (kvar).
 Three-column cluster per node; legend outside (top center), 3×2 layout.
 Solar injection uses a distinct hatch fill.
 """
+
 function _fig_reactive_power(sys::SystemData, res::OPFResult)
     nodes = collect(_NODES)
     scale = 1e-3
@@ -199,6 +203,7 @@ Two vertically stacked subplots sharing the node x-axis:
   Bottom : VUF [%] bar per node, coloured by severity.
            Nodes breaching `vuf_threshold` are drawn in _VUF_HI orange.
 """
+
 function _fig_voltage(sys::SystemData, res::OPFResult,
                       vuf_threshold::Float64 = 0.02)
 
@@ -240,6 +245,7 @@ Two vertically stacked subplots:
 
 x-axis labels show the line as "i→j".
 """
+
 function _fig_line_flows(sys::SystemData, res::OPFResult)
     nL = sys.nL
     Pij, Pji, Qij, Qji = compute_line_flows(sys, res)
@@ -267,6 +273,7 @@ Parameters
 
 Returns a Dict so callers can grab individual figures by key.
 """
+
 function plot_dashboard(
         sys::SystemData,
         res::OPFResult;
@@ -308,6 +315,7 @@ end
 Overlays multiple OE scenarios (each is Vector{OEBoundary}) on the same grid layout.
 Alignment is done by (node, phase) using oe.unit.node and oe.unit.phase.
 """
+
 function plot_operating_envelopes_overlay(
     oe_lists::Vector{Vector{OEBoundary}};
     names      = ["Scen1","Scen2","Scen3","Scen4"],
