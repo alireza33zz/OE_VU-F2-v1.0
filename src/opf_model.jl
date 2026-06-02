@@ -3,18 +3,11 @@
 # ============================================================
 
 """
-    add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, ...)
-
-Inline VUF constraints (no auxiliary variables):
-enforce |V₋|² ≤ ε²·|V₊|² and |V₊|² ≥ floor, per bus.
-"""
-"""
     add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i)
 
 Inline VUF constraints without auxiliary variables:
   enforce |V₋|² ≤ ε²·|V₊|² and (|V₊|² ≥ floor) per bus.
 """
-
 function add_vuf_constraints!(
     model::JuMP.Model,
     vuf_cfg::VUFConfig,
@@ -43,17 +36,10 @@ end
 """
     add_power_balance_exact!(model, sys, Y, ...)
 
-Exact AC power balance: S = diag(V) · (Y · conj(V))
-in rectangular coordinates, using JuMP-safe expressions.
-"""
-"""
-    add_power_balance_exact!(model, sys, Y, ...)
-
 EXACT match to your original complex form:
     S = diag(V) * (Y * conj(V))
 with V in rectangular coordinates. Built with JuMP-safe expressions.
 """
-
 function add_power_balance_exact!(
     model::JuMP.Model,
     sys::SystemData,
@@ -1373,21 +1359,10 @@ function _fig_voltage(sys::SystemData, res::OPFResult,
         legendfontcolor = _FG2,
 
 """
-    build_and_solve_opf(sys, Y, vuf_cfg; V_base, max_iter, tol, ...) -> JuMP.Model
-
-General AC-OPF builder / solver.
-
-# Keyword arguments
-- `V_base`   : nominal phase voltage magnitude [V] (default 400/√3 for NW1)
-- `max_iter` : Ipopt iteration limit
-- `tol`      : Ipopt convergence tolerance
-"""
-"""
     build_and_solve_opf(sys, Y, vuf_cfg; ...) -> JuMP.Model
 
 General OPF builder / solver.
 """
-
 function build_and_solve_opf(
     sys::SystemData,
     Y::Matrix{ComplexF64},
@@ -1729,13 +1704,7 @@ end
 
 """
     extract_result(model, nN) -> OPFResult
-
-Pull decision-variable values from a solved JuMP model into an OPFResult.
 """
-"""
-    extract_result(model, nN) -> OPFResult
-"""
-
 function extract_result(model::JuMP.Model, nN::Int)::OPFResult
     ts = termination_status(model)
     obj = (ts == MOI.LOCALLY_SOLVED || ts == MOI.OPTIMAL) ? objective_value(model) : NaN

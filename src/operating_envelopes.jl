@@ -24,7 +24,6 @@ P–Q direction, blended by its sensitivity weight.
 High-sensitivity nodes (small w) are rotated more aggressively toward their
 optimal reactive direction; low-sensitivity nodes (w ≈ 1) follow θ_global.
 """
-
 function local_optimal_angle(
     u::PVUnit,
     θ_global::Float64,
@@ -55,7 +54,6 @@ function local_optimal_angle(
 Same as compute_sensitivity_weights but accepts a pre-computed Z = inv(Y).
 Call this version inside compute_operating_envelopes to avoid re-inverting Y.
 """
-
 function compute_sensitivity_weights_cached(
     sys::SystemData,
     baseline_res::OPFResult,
@@ -1022,7 +1020,6 @@ who binds at each stage. At each angle θ and stage s:
 This is lex max-min optimal over the weighted step vector in the
 pure sense: no external fairness parameter is imposed.
 """
-
 function compute_operating_envelopes_lexmaxmin(
     sys::SystemData,
     Y::Matrix{ComplexF64},
