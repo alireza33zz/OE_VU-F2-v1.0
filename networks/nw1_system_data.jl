@@ -16,9 +16,10 @@ function build_system_data()::SystemData
     Q_Demand_c = P_Demand_c .* 0.25
 
     S_Sol_Gen_ub_a = zeros(nN); S_Sol_Gen_ub_b = zeros(nN); S_Sol_Gen_ub_c = zeros(nN)
-    for b in [3, 5, 7, 9, 11, 13]
-        S_Sol_Gen_ub_a[b] = 7500.0; S_Sol_Gen_ub_b[b] = 7500.0; S_Sol_Gen_ub_c[b] = 7500.0
-    end
+    
+    S_Sol_Gen_ub_a = Float64.([ 0,    0,    0,    0, 2500,    0,    0, 2500,    0,    0, 2500,    0,    0]) .* 1.0
+    S_Sol_Gen_ub_b = Float64.([ 0,    0,    0,    0,    0, 2500,    0,    0, 2500,    0,    0, 2500,    0]) .* 1.0
+    S_Sol_Gen_ub_c = Float64.([ 0,    0,    0,    0,    0,    0, 2500,    0,    0, 2500,    0,    0, 2500]) .* 1.0
 
     P_Cost_G   = [1.0; zeros(nN-1)]
     P_Gen_lb   = [-5_000_000.0; zeros(nN-1)]; P_Gen_ub = [5_000_000.0; zeros(nN-1)]

@@ -40,9 +40,10 @@ function build_system_data()::SystemData
     Q_Demand_b  = P_Demand_b .* 0.25
     Q_Demand_c  = P_Demand_c .* 0.25
 
-    for b in [21,34,46,57,72,80,81,103,113];  S_Sol_Gen_ub_a[b]=7500.0; end
-    for b in [25,37,47,66,77,80,93,104,114];  S_Sol_Gen_ub_b[b]=7500.0; end
-    for b in [26,39,49,62,75,80,95,106,115];  S_Sol_Gen_ub_c[b]=7500.0; end
+        # --- Solar Capacity ---
+    for b in [21, 34, 46, 57, 72, 80, 81, 103, 113]; S_Sol_Gen_ub_a[b] = 7500.0; end
+    for b in [25, 37, 47, 66, 77, 80, 93, 104, 114]; S_Sol_Gen_ub_b[b] = 7500.0; end
+    for b in [26, 39, 49, 62, 75, 80, 95, 106, 115]; S_Sol_Gen_ub_c[b] = 7500.0; end
 
     P_Cost_G   = [1.0; zeros(nN-1)]
     P_Gen_lb   = [-5_000_000.0; zeros(nN-1)]; P_Gen_ub = [5_000_000.0; zeros(nN-1)]
