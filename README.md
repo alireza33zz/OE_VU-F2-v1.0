@@ -162,11 +162,17 @@ The utilitarian problem is a nonconvex NLP, so it is solved to local optimality.
 
 ## Citation
 
-The accompanying paper is under review. A citation will be added here once it is published.
+The accompanying paper is under review. A citation will be added here once it is published. For now, please refer to the arXiv version:
 
-## License
-
-A license has not been added yet. Until one is added, all rights are reserved by the author.
+@misc{zabihi2026fairallocationoperatingenvelopes,
+      title={Fair Allocation of Operating Envelopes for Distribution Networks Considering Voltage Unbalance}, 
+      author={Alireza Zabihi and Maurizio Vassallo and Damien Ernst and Luis Badesa and Araceli Hernandez},
+      year={2026},
+      eprint={2606.29351},
+      archivePrefix={arXiv},
+      primaryClass={eess.SY},
+      url={https://arxiv.org/abs/2606.29351}, 
+}
 
 ## Contact
 
