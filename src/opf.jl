@@ -1,5 +1,5 @@
 # ============================================================
-# opf_model.jl — OPF model construction and solving
+# 3-PHASE AC-OPF MODEL (rectangular voltages, exact power balance)
 # ============================================================
 
 """
@@ -14,7 +14,7 @@ function add_vuf_constraints!(
     V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i
 )
     isempty(vuf_cfg.buses) && return
-    ar, ai  = -0.5,  sqrt(3)/2
+    ar, ai   = -0.5,  sqrt(3)/2
     a2r, a2i = -0.5, -sqrt(3)/2
     ε2  = vuf_cfg.threshold^2
     flr = vuf_cfg.pos_seq_floor
@@ -36,9 +36,8 @@ end
 """
     add_power_balance_exact!(model, sys, Y, ...)
 
-EXACT match to your original complex form:
-    S = diag(V) * (Y * conj(V))
-with V in rectangular coordinates. Built with JuMP-safe expressions.
+Exact complex power balance  S = diag(V) * conj(Y * V)
+with V in rectangular coordinates, built with JuMP-safe expressions.
 """
 function add_power_balance_exact!(
     model::JuMP.Model,
@@ -93,37 +92,33 @@ function add_power_balance_exact!(
     end
 end
 
-# ============================================================
-# 6. OPF MODEL BUILDER / SOLVER
-# ============================================================
-
 """
-    build_and_solve_opf(sys, Y, vuf_cfg; ...) -> JuMP.Model
+    build_base_model(sys, Y, vuf_cfg; fix_P, fix_Q, max_iter, tol) -> JuMP.Model
 
-General OPF builder / solver.
+Variables + all network constraints, no objective, not solved.
+Shared by the baseline OPF and every OE sub-problem.
+
+`fix_P` / `fix_Q` map (node, phase) → fixed PV injection.
 """
-function build_and_solve_opf(
+function build_base_model(
     sys::SystemData,
     Y::Matrix{ComplexF64},
-    vuf_cfg::VUFConfig            = VUFConfig();
-    fix_P_sol::Dict{Tuple{Int,Symbol},Float64} = Dict{Tuple{Int,Symbol},Float64}(),
-    fix_Q_sol::Dict{Tuple{Int,Symbol},Float64} = Dict{Tuple{Int,Symbol},Float64}(),
-    obj_r_node::Int      = 0,
-    obj_r_phase::Symbol  = :a,
-    obj_angle::Float64   = 0.0,
-    maximise::Bool       = false
+    vuf_cfg::VUFConfig = VUFConfig();
+    fix_P::Dict{Tuple{Int,Symbol},Float64} = Dict{Tuple{Int,Symbol},Float64}(),
+    fix_Q::Dict{Tuple{Int,Symbol},Float64} = Dict{Tuple{Int,Symbol},Float64}(),
+    max_iter::Int = 200_000,
+    tol::Float64  = 1e-6
 )::JuMP.Model
 
     model = Model(Ipopt.Optimizer)
-    # Conservative, robust defaults
-    set_optimizer_attribute(model, "max_iter", 200_000)
-    set_optimizer_attribute(model, "tol",      1e-6)
+    set_optimizer_attribute(model, "max_iter", max_iter)
+    set_optimizer_attribute(model, "tol",      tol)
     set_optimizer_attribute(model, "print_level", 0)
     set_optimizer_attribute(model, "linear_solver", "mumps")
     set_optimizer_attribute(model, "warm_start_init_point", "no")
 
     nN = sys.nN
-    V0 = 400.0 / sqrt(3)
+    V0 = sys.V_nom
 
     # ----------------------------------------------------------
     # Variables
@@ -142,21 +137,6 @@ function build_and_solve_opf(
     @variable(model, V_b_i[1:nN], start = V0*sin(-2π/3))
     @variable(model, V_c_r[1:nN], start = V0*cos( 2π/3))
     @variable(model, V_c_i[1:nN], start = V0*sin( 2π/3))
-
-    # ----------------------------------------------------------
-    # Objective
-    # ----------------------------------------------------------
-    if obj_r_node > 0
-        P_tgt = (obj_r_phase==:a) ? P_sol_a[obj_r_node] :
-                (obj_r_phase==:b) ? P_sol_b[obj_r_node] : P_sol_c[obj_r_node]
-        Q_tgt = (obj_r_phase==:a) ? Q_sol_a[obj_r_node] :
-                (obj_r_phase==:b) ? Q_sol_b[obj_r_node] : Q_sol_c[obj_r_node]
-        sense = maximise ? -1.0 : 1.0
-        @objective(model, Min, sense*(cos(obj_angle)*P_tgt + sin(obj_angle)*Q_tgt))
-    else
-        @objective(model, Min,
-            sum(sys.P_Cost_G[i]*(P_G_a[i]+P_G_b[i]+P_G_c[i]) for i in 1:nN))
-    end
 
     # ----------------------------------------------------------
     # Slack bus — fixed balanced reference at node 1
@@ -187,15 +167,13 @@ function build_and_solve_opf(
     @constraint(model,[i in 1:nN], P_sol_c[i]^2+Q_sol_c[i]^2 <= sys.S_Sol_Gen_ub_c[i]^2)
 
     # ----------------------------------------------------------
-    # Fixed PV setpoints (OE scans: freeze all units except target)
+    # Fixed PV setpoints (OE scans: freeze units that are not being traced)
     # ----------------------------------------------------------
-    for ((node, ph), val) in fix_P_sol
-        var = (ph==:a) ? P_sol_a : (ph==:b) ? P_sol_b : P_sol_c
-        fix(var[node], val; force=true)
+    for ((node, ph), val) in fix_P
+        fix(_pick(ph, P_sol_a, P_sol_b, P_sol_c)[node], val; force=true)
     end
-    for ((node, ph), val) in fix_Q_sol
-        var = (ph==:a) ? Q_sol_a : (ph==:b) ? Q_sol_b : Q_sol_c
-        fix(var[node], val; force=true)
+    for ((node, ph), val) in fix_Q
+        fix(_pick(ph, Q_sol_a, Q_sol_b, Q_sol_c)[node], val; force=true)
     end
 
     # ----------------------------------------------------------
@@ -206,17 +184,34 @@ function build_and_solve_opf(
     @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_c_r[i]^2+V_c_i[i]^2 <= sys.V_ub[i]^2)
 
     # ----------------------------------------------------------
-    # VUF constraints (optional, per-bus)
+    # VUF constraints (optional, per-bus) and exact nodal power balance
     # ----------------------------------------------------------
     add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i)
-
-    # ----------------------------------------------------------
-    # Nodal power balance (EXACT)
-    # ----------------------------------------------------------
     add_power_balance_exact!(model, sys, Y,
         V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i,
         P_G_a, P_G_b, P_G_c, Q_G_a, Q_G_b, Q_G_c,
         P_sol_a, P_sol_b, P_sol_c, Q_sol_a, Q_sol_b, Q_sol_c)
+
+    return model
+end
+
+"""
+    build_and_solve_opf(sys, Y, vuf_cfg; max_iter, tol) -> JuMP.Model
+
+Baseline OPF: minimise conventional generation cost.
+"""
+function build_and_solve_opf(
+    sys::SystemData,
+    Y::Matrix{ComplexF64},
+    vuf_cfg::VUFConfig = VUFConfig();
+    max_iter::Int = 200_000,
+    tol::Float64  = 1e-6
+)::JuMP.Model
+
+    model = build_base_model(sys, Y, vuf_cfg; max_iter=max_iter, tol=tol)
+    P_G_a, P_G_b, P_G_c = model[:P_G_a], model[:P_G_b], model[:P_G_c]
+    @objective(model, Min,
+        sum(sys.P_Cost_G[i]*(P_G_a[i]+P_G_b[i]+P_G_c[i]) for i in 1:sys.nN))
 
     optimize!(model)
     return model
@@ -241,15 +236,13 @@ function extract_result(model::JuMP.Model, nN::Int)::OPFResult
 end
 
 # ============================================================
-# 7. VUF POST-PROCESSING (analytical, from OPFResult)
+# POST-PROCESSING: VUF & LINE FLOWS
 # ============================================================
 
 """
     compute_vuf(res, nN) -> Vector{Float64}
 
-Compute the Voltage Unbalance Factor (%) at every bus from a solved OPFResult.
-
-VUF(%) = 100 · |V₋| / |V₊|
+Voltage Unbalance Factor (%) at every bus:  VUF(%) = 100 · |V₋| / |V₊|
 """
 function compute_vuf(res::OPFResult, nN::Int)::Vector{Float64}
     ar, ai   = -0.5,  sqrt(3)/2
@@ -277,165 +270,41 @@ function compute_vuf(res::OPFResult, nN::Int)::Vector{Float64}
     return vuf
 end
 
-# ============================================================
-# 8. LINE FLOW CALCULATION
-# ============================================================
+"""
+    compute_line_flows(sys, res) -> (Pij, Pji, Qij, Qji)
 
+Per-phase sending/receiving-end flows (nL × 3) using the π-model.
+"""
 function compute_line_flows(sys::SystemData, res::OPFResult)
-    nL  = sys.nL
-    
-    # Pre-allocate result matrices
+    nL = sys.nL
+
     Pij = zeros(nL, 3);  Pji = zeros(nL, 3)
     Qij = zeros(nL, 3);  Qji = zeros(nL, 3)
 
     for k in 1:nL
-        # --- 1. Line-specific Admittance Calculation ---
-        # Since Zij is now a Vector, we index it by k before inverting
-        Yl = inv(sys.Zij[k])
-        
-        # Build the 6x6 branch admittance matrix for THIS specific line
-        # This handles the pi-model (series admittance + shunt capacitance)
-        Yl6 = [(Yl + 0.5 .* sys.Ysh) (-Yl); 
+        # 6×6 branch admittance (series admittance + half shunt each end)
+        Yl  = inv(sys.Zij[k])
+        Yl6 = [(Yl + 0.5 .* sys.Ysh) (-Yl);
                (-Yl)                (Yl + 0.5 .* sys.Ysh)]
 
-        # --- 2. Voltage Vector Extraction ---
         i = sys.fbus[k]
         j = sys.tbus[k]
-        
-        # Construct the 6-element complex voltage vector [Vi_abc; Vj_abc]
-        v = [res.V_r_a[i] + im*res.V_i_a[i]; 
+
+        # [Vi_abc; Vj_abc]
+        v = [res.V_r_a[i] + im*res.V_i_a[i];
              res.V_r_b[i] + im*res.V_i_b[i];
-             res.V_r_c[i] + im*res.V_i_c[i]; 
+             res.V_r_c[i] + im*res.V_i_c[i];
              res.V_r_a[j] + im*res.V_i_a[j];
-             res.V_r_b[j] + im*res.V_i_b[j]; 
+             res.V_r_b[j] + im*res.V_i_b[j];
              res.V_r_c[j] + im*res.V_i_c[j]]
 
-        # --- 3. Power Flow Calculation ---
         # S = V * conj(I), where I = Y * V
         Sij = v[1:3] .* conj.(Yl6[1:3, :] * v)
         Sji = v[4:6] .* conj.(Yl6[4:6, :] * v)
 
-        # --- 4. Store Results ---
-        Pij[k, :] = real.(Sij)
-        Qij[k, :] = imag.(Sij)
-        Pji[k, :] = real.(Sji)
-        Qji[k, :] = imag.(Sji)
+        Pij[k, :] = real.(Sij);  Qij[k, :] = imag.(Sij)
+        Pji[k, :] = real.(Sji);  Qji[k, :] = imag.(Sji)
     end
 
     return Pij, Pji, Qij, Qji
-end
-
-# ============================================================
-# 9. OPERATING ENVELOPE (model reuse; no unsafe warm starts)
-# ============================================================
-
-struct PVUnit
-    node::Int
-    phase::Symbol
-    S_max::Float64
-end
-
-struct OEBoundary
-    unit::PVUnit
-    P_boundary::Vector{Float64}
-    Q_boundary::Vector{Float64}
-    P_baseline::Float64
-    Q_baseline::Float64
-end
-
-function find_pv_units(sys::SystemData)::Vector{PVUnit}
-    units = PVUnit[]
-    for i in 1:sys.nN
-        sys.S_Sol_Gen_ub_a[i] > 0 && push!(units, PVUnit(i, :a, sys.S_Sol_Gen_ub_a[i]))
-        sys.S_Sol_Gen_ub_b[i] > 0 && push!(units, PVUnit(i, :b, sys.S_Sol_Gen_ub_b[i]))
-        sys.S_Sol_Gen_ub_c[i] > 0 && push!(units, PVUnit(i, :c, sys.S_Sol_Gen_ub_c[i]))
-    end
-    return units
-end
-
-# Build one reusable OE model for a given PV unit, with other units fixed
-function build_oe_model(
-    sys::SystemData, Y::Matrix{ComplexF64}, vuf_cfg::VUFConfig;
-    fix_P::Dict{Tuple{Int,Symbol},Float64},
-    fix_Q::Dict{Tuple{Int,Symbol},Float64},
-    unit::PVUnit
-)::JuMP.Model
-
-    model = Model(Ipopt.Optimizer)
-    set_optimizer_attribute(model, "max_iter", 200_000)
-    set_optimizer_attribute(model, "tol",      1e-6)
-    set_optimizer_attribute(model, "print_level", 0)
-    set_optimizer_attribute(model, "linear_solver", "mumps")
-    set_optimizer_attribute(model, "warm_start_init_point", "no")
-
-    nN = sys.nN
-    V0 = 400.0 / sqrt(3)
-
-    # Variables
-    @variable(model, P_G_a[1:nN]);  @variable(model, Q_G_a[1:nN])
-    @variable(model, P_G_b[1:nN]);  @variable(model, Q_G_b[1:nN])
-    @variable(model, P_G_c[1:nN]);  @variable(model, Q_G_c[1:nN])
-
-    @variable(model, P_sol_a[1:nN]);  @variable(model, Q_sol_a[1:nN])
-    @variable(model, P_sol_b[1:nN]);  @variable(model, Q_sol_b[1:nN])
-    @variable(model, P_sol_c[1:nN]);  @variable(model, Q_sol_c[1:nN])
-
-    @variable(model, V_a_r[1:nN], start = V0)
-    @variable(model, V_a_i[1:nN], start = 0.0)
-    @variable(model, V_b_r[1:nN], start = V0*cos(-2π/3))
-    @variable(model, V_b_i[1:nN], start = V0*sin(-2π/3))
-    @variable(model, V_c_r[1:nN], start = V0*cos( 2π/3))
-    @variable(model, V_c_i[1:nN], start = V0*sin( 2π/3))
-
-    # Slack
-    fix(V_a_r[1], V0*cos(0);     force=true)
-    fix(V_a_i[1], V0*sin(0);     force=true)
-    fix(V_b_r[1], V0*cos(-2π/3); force=true)
-    fix(V_b_i[1], V0*sin(-2π/3); force=true)
-    fix(V_c_r[1], V0*cos( 2π/3); force=true)
-    fix(V_c_i[1], V0*sin( 2π/3); force=true)
-
-    # Limits
-    for i in 1:nN
-        s = sys.Gen_Status[i]
-        for (PG, QG) in ((P_G_a,Q_G_a),(P_G_b,Q_G_b),(P_G_c,Q_G_c))
-            @constraint(model, sys.P_Gen_lb[i]*s <= PG[i] <= sys.P_Gen_ub[i]*s)
-            @constraint(model, sys.Q_Gen_lb[i]*s <= QG[i] <= sys.Q_Gen_ub[i]*s)
-        end
-    end
-    @constraint(model,[i in 1:nN], P_sol_a[i]^2+Q_sol_a[i]^2 <= sys.S_Sol_Gen_ub_a[i]^2)
-    @constraint(model,[i in 1:nN], P_sol_b[i]^2+Q_sol_b[i]^2 <= sys.S_Sol_Gen_ub_b[i]^2)
-    @constraint(model,[i in 1:nN], P_sol_c[i]^2+Q_sol_c[i]^2 <= sys.S_Sol_Gen_ub_c[i]^2)
-
-    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_a_r[i]^2+V_a_i[i]^2 <= sys.V_ub[i]^2)
-    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_b_r[i]^2+V_b_i[i]^2 <= sys.V_ub[i]^2)
-    @constraint(model,[i in 1:nN], sys.V_lb[i]^2 <= V_c_r[i]^2+V_c_i[i]^2 <= sys.V_ub[i]^2)
-
-    # Fix all other PVs at baseline values (passed in fix_P, fix_Q)
-    for ((node, ph), val) in fix_P
-        var = (ph==:a) ? P_sol_a : (ph==:b) ? P_sol_b : P_sol_c
-        fix(var[node], val; force=true)
-    end
-    for ((node, ph), val) in fix_Q
-        var = (ph==:a) ? Q_sol_a : (ph==:b) ? Q_sol_b : Q_sol_c
-        fix(var[node], val; force=true)
-    end
-
-    # VUF & power balance
-    add_vuf_constraints!(model, vuf_cfg, V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i)
-    add_power_balance_exact!(model, sys, Y,
-        V_a_r, V_a_i, V_b_r, V_b_i, V_c_r, V_c_i,
-        P_G_a, P_G_b, P_G_c, Q_G_a, Q_G_b, Q_G_c,
-        P_sol_a, P_sol_b, P_sol_c, Q_sol_a, Q_sol_b, Q_sol_c)
-
-    return model
-end
-
-# Set / update the directional objective for a given unit and angle
-function set_directional_objective!(model::JuMP.Model, unit::PVUnit, θ::Float64)
-    P = unit.phase==:a ? model[:P_sol_a][unit.node] :
-        unit.phase==:b ? model[:P_sol_b][unit.node] : model[:P_sol_c][unit.node]
-    Q = unit.phase==:a ? model[:Q_sol_a][unit.node] :
-        unit.phase==:b ? model[:Q_sol_b][unit.node] : model[:Q_sol_c][unit.node]
-    @objective(model, Max, cos(θ)*P + sin(θ)*Q)
 end

@@ -1,11 +1,14 @@
 # ============================================================
-# types.jl — Shared struct definitions
-# All power values in W / var, voltages in V, impedances in Ω.
+# DATA TYPES
 # ============================================================
 
-import MathOptInterface as MOI
+"""
+    SystemData
 
-# ── Network parameters ──────────────────────────────────────
+Immutable struct holding all network parameters.
+Power in W / var, voltages in V, impedances in Ω.
+`V_nom` is the nominal phase-to-neutral voltage (slack reference and flat start).
+"""
 struct SystemData
     nN::Int
     nL::Int
@@ -22,31 +25,43 @@ struct SystemData
     S_Sol_Gen_ub_b::Vector{Float64}
     S_Sol_Gen_ub_c::Vector{Float64}
 
+    V_nom::Float64
     V_lb::Vector{Float64};  V_ub::Vector{Float64}
 
     fbus::Vector{Int};  tbus::Vector{Int}
-    Zij::Vector{Matrix{ComplexF64}}   # ← changed from Matrix to Vector{Matrix}
+    Zij::Vector{Matrix{ComplexF64}}   # one 3×3 series impedance per branch
     Ysh::Matrix{ComplexF64}
 end
 
-# ── VUF constraint configuration ────────────────────────────
+"""
+    VUFConfig
+
+Specifies where and how tightly VUF is enforced.
+`pos_seq_floor` defaults to (0.5·V_nom)², so pass the network's `V_nom`.
+"""
 struct VUFConfig
     buses::Vector{Int}
     threshold::Float64
     pos_seq_floor::Float64
 
     function VUFConfig(buses::Vector{Int};
-                       threshold::Float64    = 0.02,
-                       pos_seq_floor::Float64 = (0.5 * 400.0/sqrt(3))^2)
+                       threshold::Float64     = 0.02,
+                       V_nom::Float64         = 400.0/sqrt(3),
+                       pos_seq_floor::Float64 = (0.5 * V_nom)^2)
         @assert 0.0 < threshold < 1.0  "VUF threshold must be in (0, 1)."
         new(buses, threshold, pos_seq_floor)
     end
 end
 
 # Convenience constructor: no VUF enforcement
-VUFConfig() = VUFConfig(Int[]; threshold = 0.02)
+VUFConfig() = VUFConfig(Int[]; threshold=0.02)
 
-# ── OPF solution snapshot ────────────────────────────────────
+"""
+    OPFResult
+
+Extracted solution snapshot from one OPF solve.
+Decouples downstream analysis from the live JuMP model.
+"""
 struct OPFResult
     status::MOI.TerminationStatusCode
     obj::Float64
@@ -64,14 +79,12 @@ struct OPFResult
     P_sol_c::Vector{Float64};  Q_sol_c::Vector{Float64}
 end
 
-# ── PV unit descriptor ───────────────────────────────────────
 struct PVUnit
     node::Int
     phase::Symbol
     S_max::Float64
 end
 
-# ── Operating-envelope boundary ──────────────────────────────
 struct OEBoundary
     unit::PVUnit
     P_boundary::Vector{Float64}
@@ -79,3 +92,11 @@ struct OEBoundary
     P_baseline::Float64
     Q_baseline::Float64
 end
+
+# ── Small accessors used throughout (phase symbol → field) ──────────────────
+_pick(ph::Symbol, a, b, c) = ph == :a ? a : ph == :b ? b : c
+
+P_sol_of(res::OPFResult, u::PVUnit) = _pick(u.phase, res.P_sol_a, res.P_sol_b, res.P_sol_c)[u.node]
+Q_sol_of(res::OPFResult, u::PVUnit) = _pick(u.phase, res.Q_sol_a, res.Q_sol_b, res.Q_sol_c)[u.node]
+S_cap_of(sys::SystemData, u::PVUnit) =
+    _pick(u.phase, sys.S_Sol_Gen_ub_a, sys.S_Sol_Gen_ub_b, sys.S_Sol_Gen_ub_c)[u.node]

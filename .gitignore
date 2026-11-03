@@ -1,16 +1,26 @@
 # Julia
+Manifest.toml
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
-Manifest.toml
-.julia/
 
-# Generated outputs (created at runtime)
-outputs/
+# Generated outputs (recreated by the run scripts)
+Graphics/
+opf_fairness_figures/
+opf_fairness_LEX_figures/
+opf_figures/
+system_matrix.xlsx
 
-# IDE / OS
+# Manuscript and private notes
+*.tex
+*.docx
+*.bib
+
+# Archive of old development scripts
+archive/
+
+# OS / editor
 .DS_Store
+Thumbs.db
+desktop.ini
 .vscode/
-.idea/
-*.swp
-*~
